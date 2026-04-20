@@ -121,9 +121,12 @@ def run_rolling_backtest(
 
     Returns
     -------
-    pd.DataFrame
-        Out-of-sample predictions.  Columns:
-        [date, ticker, fwd_return, target, <model>_prob, ensemble_prob]
+    tuple[pd.DataFrame, dict]
+        - predictions: Out-of-sample predictions with columns
+          [date, ticker, fwd_return, target, <model>_prob, ensemble_prob]
+        - dnn_histories: dict mapping window_index (1-based) to a list of
+          per-epoch dicts {epoch, train_loss, val_loss, is_best}.
+          Empty dict when DNN is not in the enabled model list.
     """
     enabled = models_override or cfg.enabled_models
     # Exclude "ensemble" – it's built from the others
@@ -145,30 +148,31 @@ def run_rolling_backtest(
         )
 
     all_preds: list[pd.DataFrame] = []
+    # key: 1-based window index, value: list of per-epoch history dicts
+    dnn_histories: dict[int, list[dict]] = {}
 
     for w_idx, window in enumerate(windows):
+        w_num = w_idx + 1
+        n_windows = len(windows)
         logger.info(
-            "── Window %d/%d │ train %s→%s │ test %s→%s",
-            w_idx + 1,
-            len(windows),
-            window.train_start.date(),
-            window.train_end.date(),
-            window.test_start.date(),
-            window.test_end.date(),
+            "── Window %d/%d │ train %s->%s │ test %s->%s",
+            w_num, n_windows,
+            window.train_start.date(), window.train_end.date(),
+            window.test_start.date(), window.test_end.date(),
         )
 
         # ── Slice data ────────────────────────────────────────────────────
         dates = feature_panel.index.get_level_values("date")
 
         train_mask = (dates >= window.train_start) & (dates <= window.train_end)
-        val_mask = (dates >= window.val_start) & (dates <= window.train_end)
-        test_mask = (dates >= window.test_start) & (dates <= window.test_end)
+        val_mask   = (dates >= window.val_start)   & (dates <= window.train_end)
+        test_mask  = (dates >= window.test_start)  & (dates <= window.test_end)
 
         X_all_train = feature_panel.loc[train_mask]
         y_all_train = target_series.loc[train_mask]
-        X_val = feature_panel.loc[val_mask]
-        y_val = target_series.loc[val_mask]
-        X_test = feature_panel.loc[test_mask]
+        X_val       = feature_panel.loc[val_mask]
+        y_val       = target_series.loc[val_mask]
+        X_test      = feature_panel.loc[test_mask]
 
         # Drop rows with NaN targets
         valid_train = y_all_train.notna()
@@ -180,7 +184,7 @@ def run_rolling_backtest(
         y_v = y_val.loc[valid_val]
 
         if len(X_tr) < 100:
-            logger.warning("Window %d: too few training rows (%d), skipping.", w_idx + 1, len(X_tr))
+            logger.warning("Window %d: too few training rows (%d), skipping.", w_num, len(X_tr))
             continue
 
         # ── Preprocessing (fit on train only) ─────────────────────────────
@@ -189,12 +193,12 @@ def run_rolling_backtest(
             winsorize_pct=cfg._raw["features"]["winsorize_pct"],
         )
         prep.fit(X_tr)
-        X_tr_s = prep.transform(X_tr)
-        X_v_s = prep.transform(X_v)
+        X_tr_s   = prep.transform(X_tr)
+        X_v_s    = prep.transform(X_v)
         X_test_s = prep.transform(X_test)
 
         y_tr_np = y_tr.values
-        y_v_np = y_v.values if len(y_v) > 0 else None
+        y_v_np  = y_v.values if len(y_v) > 0 else None
 
         # ── Train and predict each base model ─────────────────────────────
         fitted_models: list[BaseStockModel] = []
@@ -203,6 +207,14 @@ def run_rolling_backtest(
         for model_name in base_model_names:
             try:
                 model = get_model(model_name, cfg)
+
+                # Tag DNN/LSTM with window context for progress logging
+                if hasattr(model, "_window_tag"):
+                    model._window_tag = (
+                        f"{model_name} W{w_num}/{n_windows} "
+                        f"({window.train_start.year}-{window.test_end.year})"
+                    )
+
                 model.fit(
                     X_tr_s,
                     y_tr_np,
@@ -212,8 +224,19 @@ def run_rolling_backtest(
                 proba = model.predict_proba(X_test_s)[:, 1]
                 test_probas[model_name] = proba
                 fitted_models.append(model)
+
+                # Collect DNN training history for loss-curve visualisation
+                if model_name == "dnn" and hasattr(model, "training_history_"):
+                    dnn_histories[w_num] = {
+                        "history":     model.training_history_,
+                        "train_start": str(window.train_start.date()),
+                        "train_end":   str(window.train_end.date()),
+                        "test_start":  str(window.test_start.date()),
+                        "test_end":    str(window.test_end.date()),
+                    }
+
             except Exception as exc:  # noqa: BLE001
-                logger.error("[%s] failed in window %d: %s", model_name, w_idx + 1, exc)
+                logger.error("[%s] failed in window %d: %s", model_name, w_num, exc)
 
         # ── Ensemble ──────────────────────────────────────────────────────
         if include_ensemble and fitted_models:
@@ -224,7 +247,7 @@ def run_rolling_backtest(
         # ── Assemble predictions DataFrame ────────────────────────────────
         pred_df = pd.DataFrame(index=X_test.index)
         pred_df["fwd_return"] = fwd_return_series.reindex(X_test.index)
-        pred_df["target"] = target_series.reindex(X_test.index)
+        pred_df["target"]     = target_series.reindex(X_test.index)
 
         for model_name, proba in test_probas.items():
             if len(proba) == len(pred_df):
@@ -233,10 +256,7 @@ def run_rolling_backtest(
                 logger.warning(
                     "Probability length mismatch for %s in window %d "
                     "(expected %d, got %d).",
-                    model_name,
-                    w_idx + 1,
-                    len(pred_df),
-                    len(proba),
+                    model_name, w_num, len(pred_df), len(proba),
                 )
 
         all_preds.append(pred_df)
@@ -246,9 +266,9 @@ def run_rolling_backtest(
 
     result = pd.concat(all_preds).sort_index()
     logger.info(
-        "Rolling backtest complete: %d out-of-sample rows, date range %s – %s",
+        "Rolling backtest complete: %d out-of-sample rows, date range %s - %s",
         len(result),
         result.index.get_level_values("date").min().date(),
         result.index.get_level_values("date").max().date(),
     )
-    return result
+    return result, dnn_histories

@@ -13,6 +13,8 @@ models:
     - pca_logistic
     - random_forest
     - xgboost
+    - dnn
+    - lstm
     - ensemble
 
   # Tighter CV grids to keep backtest runtime manageable
@@ -47,6 +49,41 @@ models:
     colsample_bytree_grid: [0.8]
     gamma_grid: [0]
     cv_folds: 3
+
+  # DNN: paper architecture (Section 3.5)
+  # 3 hidden layers 20-10-5, BatchNorm, L1=0.0001, RMSprop lr=0.001
+  # Early stopping patience=10 keeps runtime well under 5 min per window.
+  dnn:
+    hidden_layers: [20, 10, 5]
+    epochs: 100
+    early_stopping_patience: 10
+    learning_rate: 0.001
+    l1_reg: 0.0001
+    batch_norm: true
+    dropout: 0.0
+    batch_size: 512
+    grad_clip: 1.0
+    log_every_n_epochs: 10
+    seed: 42
+
+  # LSTM: paper architecture (Section 3.6)
+  # 1 hidden layer, 30 cells, seq_len=8 weeks
+  # Sequences built per-ticker to avoid cross-stock contamination.
+  # weight_decay provides L2 reg equivalent to DNN's l1_reg.
+  # Dropout on FC layer prevents rapid overfitting on financial noise.
+  lstm:
+    hidden_units: 30
+    seq_len: 8
+    epochs: 100
+    early_stopping_patience: 15    # extra patience; financial data is noisy
+    learning_rate: 0.001
+    weight_decay: 0.0001           # L2 regularisation via RMSprop weight_decay
+    l1_reg: 0.0001                 # explicit L1 on weight tensors (same scale as DNN)
+    dropout: 0.2                   # regularise the LSTM→FC connection
+    batch_size: 256
+    grad_clip: 1.0
+    log_every_n_epochs: 10
+    seed: 42
 
 rolling:
   train_years: 3

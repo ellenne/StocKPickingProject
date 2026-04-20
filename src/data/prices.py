@@ -64,25 +64,40 @@ def _fetch_prices_batch(
 def _daily_to_weekly(daily: pd.DataFrame) -> pd.DataFrame:
     """Resample daily OHLCV to weekly (Wednesday) frequency.
 
-    For each week the resampled row corresponds to the Wednesday close (or
-    the next available day if Wednesday is a holiday).
+    Wolff & Echterling (2022) Section 2: "If a Wednesday is a non-trading day
+    (holiday), we use data of the next trading day available."
 
-    The resampling uses:
-      open  → first open of the week
-      high  → max high of the week
-      low   → min low of the week
-      close → last close of the week (= Wednesday or next day)
-      volume → sum of daily volume
+    Implementation
+    --------------
+    * Open / High / Low / Volume: period-based aggregates over the Thu–Wed window
+      (first, max, min, sum respectively).
+    * Close: the paper requires the NEXT available trading day when Wednesday is a
+      holiday.  We achieve this with ``reindex(..., method="bfill")`` which maps
+      each Wednesday to the first trading day >= that Wednesday within ±4 days
+      (stays within the same week; never crosses into the following Wednesday).
+
+    Note: the previous implementation used ``resample(..., Close="last")`` which
+    picks the PREVIOUS trading day for Wednesday holidays – the opposite direction.
     """
-    agg = {
-        "Open": "first",
-        "High": "max",
-        "Low": "min",
-        "Close": "last",
-        "Volume": "sum",
-    }
-    # W-WED anchors week-end to Wednesday → the period covers Thu–Wed
-    weekly = daily.resample(_WEDNESDAY).agg(agg)
+    # ── Period aggregates for O / H / L / V ──────────────────────────────────
+    agg_map = {k: v for k, v in
+               {"Open": "first", "High": "max", "Low": "min", "Volume": "sum"}.items()
+               if k in daily.columns}
+    if agg_map:
+        weekly = daily.resample(_WEDNESDAY).agg(agg_map)
+    else:
+        # No OHLV columns present – seed an empty frame with W-WED dates
+        weekly = pd.DataFrame(index=daily.resample(_WEDNESDAY).first().index)
+
+    # ── Close: next trading day on or after Wednesday (paper-faithful) ───────
+    if "Close" in daily.columns:
+        # bfill: for each Wednesday label, use the first available day >= that date
+        # tolerance="4D": only look Thursday–Sunday (same week, never next Wednesday)
+        close_next = daily[["Close"]].reindex(
+            weekly.index, method="bfill", tolerance=pd.Timedelta("4D")
+        )
+        weekly["Close"] = close_next["Close"]
+
     weekly = weekly.dropna(how="all")
     return weekly
 

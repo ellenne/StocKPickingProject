@@ -212,9 +212,16 @@ def train_backtest(ctx: click.Context, models: str | None, top_n: int | None, no
     from src.backtest.rolling_training import run_rolling_backtest
 
     console.print("Starting rolling backtest …")
-    predictions = run_rolling_backtest(
+    predictions, dnn_histories = run_rolling_backtest(
         feature_panel, target_series, fwd_return_series, cfg, models_list
     )
+    if dnn_histories:
+        import json
+        dnn_hist_path = cfg.outputs_dir / "dnn_training_histories.json"
+        dnn_hist_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(dnn_hist_path, "w", encoding="utf-8") as _f:
+            json.dump(dnn_histories, _f, indent=2)
+        console.print(f"  DNN training histories saved to {dnn_hist_path}")
 
     # ── Portfolio construction ────────────────────────────────────────────
     from src.backtest.portfolio import (
@@ -272,6 +279,7 @@ def train_backtest(ctx: click.Context, models: str | None, top_n: int | None, no
         predictions, returns_dict, holdings_dict, metrics_df,
         feature_panel, cfg.outputs_dir, n,
         fmt=cfg._raw["outputs"]["chart_format"],
+        dnn_histories=dnn_histories if dnn_histories else None,
     )
 
     # ── Print summary ─────────────────────────────────────────────────────
@@ -348,6 +356,198 @@ def current_picks(ctx: click.Context, top_n: int, model: str) -> None:
 
     generate_current_picks_report(predictions, cfg.outputs_dir, top_n)
     console.print(f"\n[green]✓ Report saved to {cfg.outputs_dir / 'current_picks.md'}[/green]")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  compute-shap
+# ─────────────────────────────────────────────────────────────────────────────
+
+@cli.command("compute-shap")
+@click.option("--panel", default=None, show_default=True,
+              help="Path to processed panel parquet. Defaults to data/processed/weekly_panel.parquet.")
+@click.option("--models", default=None, show_default=True,
+              help="Comma-separated model names. Defaults to enabled models in config.")
+@click.option("--window", default=-1, show_default=True, type=int,
+              help="Rolling window index (1-based). Use -1 for the last window.")
+@click.option("--n-bg", default=300, show_default=True,
+              help="Background samples for LinearExplainer / KernelExplainer.")
+@click.option("--n-bg-deep", default=100, show_default=True,
+              help="Background samples for DeepExplainer (DNN).")
+@click.option("--n-test", default=500, show_default=True,
+              help="Max test rows for SHAP evaluation (slow explainers).")
+@click.option("--nsamples-kernel", default=150, show_default=True,
+              help="Coalition samples per test row for KernelExplainer.")
+@click.option("--top-n", default=20, show_default=True,
+              help="Number of top features shown in bar charts.")
+@click.pass_context
+def compute_shap_cmd(
+    ctx: click.Context,
+    panel: str | None,
+    models: str | None,
+    window: int,
+    n_bg: int,
+    n_bg_deep: int,
+    n_test: int,
+    nsamples_kernel: int,
+    top_n: int,
+) -> None:
+    """Compute SHAP feature importances and reproduce paper Figure 8.
+
+    Refits all enabled models on the specified rolling window's training data,
+    then runs the appropriate SHAP explainer for each model type:
+
+      Ridge / Lasso / ElasticNet  - LinearExplainer  (fast)\n
+      RandomForest / XGBoost      - TreeExplainer    (fast)\n
+      DNN                         - DeepExplainer    (fast, PyTorch)\n
+      LSTM / PCA-Logistic         - KernelExplainer  (slow, model-agnostic)\n
+
+    Outputs saved to <outputs_dir>/shap/:
+      shap_heatmap.<fmt>           - Figure 8 style heatmap\n
+      shap_summary_bars.<fmt>      - Top-N features per model\n
+      shap_group_comparison.<fmt>  - Technical vs Fundamental fractions\n
+      shap_beeswarm_<model>.<fmt>  - Per-model beeswarm plots\n
+      shap_importance.csv          - Raw mean |SHAP| table\n
+    """
+    import numpy as np
+    import pandas as pd
+
+    cfg = ctx.obj["cfg"]
+    console.rule("[bold blue]SHAP Feature Importance Analysis")
+
+    # ── Load panel ────────────────────────────────────────────────────────
+    panel_path = Path(panel) if panel else cfg.cache_dir / "processed" / "weekly_panel.parquet"
+    if not panel_path.exists():
+        # Try the default processed path
+        panel_path = Path("data/processed/weekly_panel.parquet")
+    if not panel_path.exists():
+        console.print(
+            "[red]Processed panel not found. Run [bold]build-dataset[/bold] first.[/red]"
+        )
+        sys.exit(1)
+
+    console.print(f"Loading panel from {panel_path} …")
+    full_panel = pd.read_parquet(panel_path)
+    console.print(f"  Panel shape: {full_panel.shape}")
+
+    # ── Separate features from target/return columns ───────────────────
+    exclude = {"target", "fwd_return", "fwd_log_return"}
+    feature_cols = [c for c in full_panel.columns if c not in exclude]
+    feature_panel = full_panel[feature_cols]
+
+    if "target" not in full_panel.columns:
+        console.print("[red]'target' column missing from panel.[/red]")
+        sys.exit(1)
+    target_series = full_panel["target"]
+
+    # ── Generate windows, pick the requested one ───────────────────────
+    from src.backtest.rolling_training import _generate_windows
+
+    all_dates = feature_panel.index.get_level_values("date").unique().sort_values()
+    windows = _generate_windows(
+        all_dates, cfg.train_years, cfg.test_years,
+        cfg._raw["rolling"]["val_fraction"],
+    )
+    if not windows:
+        console.print("[red]Not enough data to form a rolling window.[/red]")
+        sys.exit(1)
+
+    w_idx = (window - 1) if window > 0 else (len(windows) + window)
+    w_idx = max(0, min(w_idx, len(windows) - 1))
+    win = windows[w_idx]
+    console.print(
+        f"  Using window {w_idx + 1}/{len(windows)}: "
+        f"train {win.train_start.date()} to {win.train_end.date()}, "
+        f"test  {win.test_start.date()} to {win.test_end.date()}"
+    )
+
+    # ── Slice train/test ───────────────────────────────────────────────
+    dates = feature_panel.index.get_level_values("date")
+    train_mask = (dates >= win.train_start) & (dates <= win.train_end)
+    test_mask  = (dates >= win.test_start)  & (dates <= win.test_end)
+
+    X_tr_raw = feature_panel.loc[train_mask]
+    y_tr_raw = target_series.loc[train_mask]
+    X_te_raw = feature_panel.loc[test_mask]
+
+    valid_train = y_tr_raw.notna()
+    X_tr_raw = X_tr_raw.loc[valid_train]
+    y_tr_raw = y_tr_raw.loc[valid_train]
+
+    # ── Preprocess (fit on train only) ─────────────────────────────────
+    from src.features.preprocessing import FeaturePreprocessor
+
+    prep = FeaturePreprocessor(
+        winsorize=cfg._raw["features"]["winsorize"],
+        winsorize_pct=cfg._raw["features"]["winsorize_pct"],
+    )
+    prep.fit(X_tr_raw)
+    X_tr = prep.transform(X_tr_raw).values.astype(np.float32)
+    X_te = prep.transform(X_te_raw).values.astype(np.float32)
+    y_tr = y_tr_raw.values.astype(np.int64)
+    feature_names = list(feature_cols)
+
+    console.print(
+        f"  Train rows: {len(X_tr)}, Test rows: {len(X_te)}, "
+        f"Features: {len(feature_names)}"
+    )
+
+    # ── Fit models ─────────────────────────────────────────────────────
+    model_names = models.split(",") if models else [
+        m for m in cfg.enabled_models if m != "ensemble"
+    ]
+    from src.models.base import get_model
+
+    fitted: dict = {}
+    for model_name in model_names:
+        console.print(f"  Fitting [bold]{model_name}[/bold] …")
+        try:
+            m = get_model(model_name, cfg)
+            # Pass DataFrame so LSTM gets proper MultiIndex sequences
+            m.fit(X_tr_raw.pipe(prep.transform), y_tr,
+                  X_te_raw.pipe(prep.transform), None)
+            fitted[model_name] = m
+        except Exception as exc:
+            console.print(f"  [yellow]Warning: {model_name} failed: {exc}[/yellow]")
+
+    if not fitted:
+        console.print("[red]No models fitted successfully.[/red]")
+        sys.exit(1)
+
+    # ── Run SHAP ───────────────────────────────────────────────────────
+    from src.reports.shap_analysis import run_shap_analysis
+
+    fmt = cfg._raw["outputs"]["chart_format"]
+    console.print(
+        f"\nRunning SHAP for {list(fitted.keys())} "
+        f"(n_bg={n_bg}, n_test={n_test}, kernel_samples={nsamples_kernel}) …"
+    )
+    shap_dict = run_shap_analysis(
+        fitted, X_tr, X_te, feature_names,
+        outputs_dir=cfg.outputs_dir,
+        fmt=fmt,
+        n_bg=n_bg,
+        n_test=n_test,
+        n_bg_deep=n_bg_deep,
+        nsamples_kernel=nsamples_kernel,
+        top_n_bars=top_n,
+    )
+
+    # ── Summary table ──────────────────────────────────────────────────
+    if shap_dict:
+        from src.reports.shap_analysis import _mean_abs, feature_group
+        console.rule("[bold green]Top-5 Features per Model")
+        for model_name, sv in shap_dict.items():
+            imp   = _mean_abs(sv)
+            order = np.argsort(imp)[::-1][:5]
+            top   = [(feature_names[i], imp[i], feature_group(feature_names[i]))
+                     for i in order]
+            tbl_str = "  ".join(f"{n} ({g[0]}): {v:.4f}" for n, v, g in top)
+            console.print(f"[bold]{model_name:15s}[/bold]  {tbl_str}")
+
+    shap_dir = cfg.outputs_dir / "shap"
+    console.print(
+        f"\n[green]SHAP analysis complete. Outputs in {shap_dir}[/green]"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
