@@ -157,6 +157,90 @@ def plot_feature_importance(
     _save(fig, outputs_dir / "feature_importance", fmt)
 
 
+def plot_dnn_training_history(
+    dnn_histories: dict,
+    outputs_dir: Path,
+    fmt: str = "png",
+) -> None:
+    """Plot DNN training and validation loss curves for every rolling window.
+
+    Parameters
+    ----------
+    dnn_histories:
+        Dict returned by ``run_rolling_backtest``.  Keys are 1-based window
+        indices; values are dicts with keys ``history`` (list of epoch dicts),
+        ``train_start``, ``train_end``, ``test_start``, ``test_end``.
+    outputs_dir:
+        Output folder.
+    fmt:
+        File format (png/pdf/svg).
+    """
+    if not dnn_histories:
+        logger.info("No DNN training histories – skipping chart.")
+        return
+
+    n_windows = len(dnn_histories)
+    ncols = min(3, n_windows)
+    nrows = (n_windows + ncols - 1) // ncols
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(6 * ncols, 4 * nrows),
+        squeeze=False,
+    )
+
+    all_axes_flat = [axes[r][c] for r in range(nrows) for c in range(ncols)]
+
+    for ax_flat, (w_num, w_data) in zip(
+        all_axes_flat,
+        sorted(dnn_histories.items()),
+    ):
+        history = w_data.get("history", [])
+        if not history:
+            ax_flat.set_visible(False)
+            continue
+
+        epochs     = [h["epoch"]      for h in history]
+        train_loss = [h["train_loss"]  for h in history]
+        val_loss   = [h["val_loss"]    for h in history if h["val_loss"] is not None]
+        val_epochs = [h["epoch"]       for h in history if h["val_loss"] is not None]
+        best_mask  = [h["epoch"]       for h in history if h.get("is_best")]
+
+        ax_flat.plot(epochs, train_loss, color="#457b9d", linewidth=1.6, label="Train loss")
+        if val_loss:
+            ax_flat.plot(val_epochs, val_loss, color="#e63946", linewidth=1.6,
+                         linestyle="--", label="Val loss")
+        if best_mask:
+            best_vals = [
+                h["val_loss"] for h in history
+                if h.get("is_best") and h["val_loss"] is not None
+            ]
+            ax_flat.scatter(best_mask, best_vals, color="#2a9d8f", s=30, zorder=5,
+                            label="Best epoch")
+
+        label = (
+            f"W{w_num}: {w_data.get('train_start', '')[:7]} - "
+            f"{w_data.get('test_end', '')[:7]}"
+        )
+        stopped = epochs[-1]
+        ax_flat.set_title(f"{label}\nstopped ep {stopped}", fontsize=9, fontweight="bold")
+        ax_flat.set_xlabel("Epoch", fontsize=8)
+        ax_flat.set_ylabel("CE Loss", fontsize=8)
+        ax_flat.legend(fontsize=7, loc="upper right")
+        ax_flat.grid(True, alpha=0.3)
+
+    # Hide any unused subplots
+    for ax_extra in all_axes_flat[n_windows:]:
+        ax_extra.set_visible(False)
+
+    fig.suptitle(
+        "DNN Training Curves Across Rolling Windows\n"
+        "(solid=train, dashed=val, dot=best epoch)",
+        fontsize=12, fontweight="bold",
+    )
+    fig.tight_layout()
+    _save(fig, outputs_dir / "dnn_training_curves", fmt)
+
+
 def plot_model_comparison_table(
     metrics_df: pd.DataFrame,
     outputs_dir: Path,

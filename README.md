@@ -6,6 +6,22 @@ A production-quality Python implementation of the stock-picking strategy describ
 > *Stock Picking with Machine Learning.*  
 > SSRN Working Paper 3607845.
 
+## Documentation
+
+Full project documentation lives in the [`docs/`](docs/index.md) folder:
+
+| Document | Description |
+|---|---|
+| [Quick Start](docs/quickstart.md) | Installation and first run |
+| [Architecture](docs/architecture.md) | Directory layout and data flow |
+| [Data Pipeline](docs/data_pipeline.md) | Download, caching, `input/` store |
+| [Feature Engineering](docs/features.md) | All features, formulas, NaN treatment |
+| [Models](docs/models.md) | Every ML model with configuration |
+| [Backtesting](docs/backtest.md) | Rolling window, metrics, transaction costs |
+| [Configuration](docs/configuration.md) | Full YAML reference |
+| [CLI Reference](docs/cli_reference.md) | All commands and options |
+| [Paper Alignment Audit](docs/paper_alignment_audit.md) | Validation vs Wolff & Echterling (2022) |
+
 ---
 
 ## Project overview

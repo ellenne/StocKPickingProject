@@ -9,14 +9,24 @@ yfinance ``Ticker.info`` provides a single-snapshot dict with ~150 fields
 covering most of the paper's fundamental variables.  Fields are fetched once
 per ticker, cached, and then aligned to the weekly panel.
 
+IMPORTANT – known lookahead bias in Phase-1
+────────────────────────────────────────────
 Because ``yfinance.info`` returns *current* fundamentals (not time-series),
 Phase-1 treats fundamentals as **static** inputs that are repeated across all
-weeks.  The 3-month lookahead lag is applied by shifting the entire block
-forward by ``fundamentals_lag_months`` months relative to the price date.
+weeks.  This means 2025 values (today's P/B, margins, etc.) are used for
+predictions in 2015–2024, introducing a forward-looking bias.
 
-Phase-2 upgrade path: replace ``_fetch_fundamentals_yfinance`` with a
-time-series source (e.g. SimFin, SEC EDGAR XBRL, or FMP) to get quarterly
-snapshots and eliminate the static approximation.
+The 3-month lag applied in ``align_fundamentals_to_panel`` only zeroes out the
+first quarter of the panel.  It does NOT prevent the model from seeing future
+fundamental values for historical dates.
+
+As a result, backtested performance of fundamental-driven models will be
+optimistically biased.  The magnitude depends on how much fundamentals
+changed over the sample period.
+
+Phase-2 upgrade: replace this module with a time-series source (SEC EDGAR
+XBRL, SimFin, Compustat, or FMP) that provides quarterly snapshots with
+actual announcement dates, then apply the 3-month lag per filing date.
 
 Available fundamental fields mapped to paper variables
 ───────────────────────────────────────────────────────

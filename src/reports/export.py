@@ -20,6 +20,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.reports.charts import (
+    plot_dnn_training_history,
     plot_drawdown,
     plot_equity_curves,
     plot_feature_importance,
@@ -131,6 +132,7 @@ def generate_full_report(
     outputs_dir: Path,
     top_n: int = 50,
     fmt: str = "png",
+    dnn_histories: dict | None = None,
 ) -> None:
     """Orchestrate all report generation.
 
@@ -139,9 +141,9 @@ def generate_full_report(
     predictions:
         Full out-of-sample predictions DataFrame.
     returns_dict:
-        {model_name → weekly return Series}.
+        {model_name -> weekly return Series}.
     holdings_dict:
-        {model_name → holdings DataFrame}.
+        {model_name -> holdings DataFrame}.
     metrics_df:
         Model metrics comparison table.
     feature_panel:
@@ -152,6 +154,9 @@ def generate_full_report(
         Portfolio size.
     fmt:
         Chart file format.
+    dnn_histories:
+        Optional dict of DNN training histories from run_rolling_backtest.
+        When provided, ``dnn_training_curves.<fmt>`` is generated.
     """
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -169,6 +174,9 @@ def generate_full_report(
     plot_drawdown(ensemble_ret, bench_ret, outputs_dir, fmt)
     plot_rolling_sharpe(returns_dict, outputs_dir, fmt)
     plot_model_comparison_table(metrics_df, outputs_dir, fmt)
+
+    if dnn_histories:
+        plot_dnn_training_history(dnn_histories, outputs_dir, fmt)
 
     # ── Tables ────────────────────────────────────────────────────────────
     build_feature_availability_report(feature_panel, outputs_dir)

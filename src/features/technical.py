@@ -139,10 +139,14 @@ def compute_technical_features(
     features["vol_1m"] = log_ret.rolling(_WEEKS_1M).std() * np.sqrt(_WEEKS_PER_YEAR)
 
     # ── RSI ───────────────────────────────────────────────────────────────
-    # RSI windows: 14d ≈ 3 weeks, 9d ≈ 2 weeks, 3d ≈ 1 week at weekly freq
+    # Paper uses daily RSI(14), RSI(9), RSI(3); we approximate at weekly freq.
+    # Mapping: 14d ≈ 3 weeks, 9d ≈ 2 weeks, 3d ≈ 2 weeks (minimum viable).
+    # Note: window=1 (for 3d→1w) gives Wilder alpha=1.0 (zero memory), which
+    # produces ~55% NaN (undefined RSI when loss_ewm==0).  Using window=2 as
+    # the minimum meaningful Wilder window at weekly frequency.
     rsi_dict_14 = {col: _rsi(close_panel[col], 3) for col in close_panel.columns}
     rsi_dict_9 = {col: _rsi(close_panel[col], 2) for col in close_panel.columns}
-    rsi_dict_3 = {col: _rsi(close_panel[col], 1) for col in close_panel.columns}
+    rsi_dict_3 = {col: _rsi(close_panel[col], 2) for col in close_panel.columns}  # window≥2
     features["rsi_14"] = pd.DataFrame(rsi_dict_14, index=close_panel.index)
     features["rsi_9"] = pd.DataFrame(rsi_dict_9, index=close_panel.index)
     features["rsi_3"] = pd.DataFrame(rsi_dict_3, index=close_panel.index)
