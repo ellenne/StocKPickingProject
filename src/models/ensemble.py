@@ -15,7 +15,7 @@ instances and averages their ``predict_proba`` outputs.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -65,3 +65,59 @@ class EnsembleModel(BaseStockModel):
     ) -> dict[str, np.ndarray]:
         """Return per-model probability arrays (useful for diagnostics)."""
         return {m.name: m.predict_proba(X)[:, 1] for m in self._models}
+
+
+class PerformanceWeightedEnsemble:
+    """Performance-weighted ensemble based on rolling Sharpe ratios."""
+
+    def __init__(self, lookback_windows: int = 3):
+        """
+        Args:
+            lookback_windows: Number of past windows to use for weighting.
+        """
+        self.lookback_windows = lookback_windows
+        self.performance_history: Dict[str, list] = {}
+        self.weights: Dict[str, float] = {}
+
+    def update_performance(self, model_name: str, returns: np.ndarray) -> None:
+        """Update performance history for a model."""
+        if model_name not in self.performance_history:
+            self.performance_history[model_name] = []
+
+        if len(returns) > 0 and np.std(returns) > 0:
+            sharpe = np.mean(returns) * 52 / (np.std(returns) * np.sqrt(52))
+        else:
+            sharpe = 0.0
+
+        self.performance_history[model_name].append(sharpe)
+        if len(self.performance_history[model_name]) > self.lookback_windows:
+            self.performance_history[model_name] = (
+                self.performance_history[model_name][-self.lookback_windows:]
+            )
+
+    def calculate_weights(self, model_names: List[str]) -> Dict[str, float]:
+        """Calculate performance-weighted ensemble weights."""
+        avg_sharpes = {
+            model: (
+                float(np.mean(self.performance_history[model]))
+                if model in self.performance_history and self.performance_history[model]
+                else 0.0
+            )
+            for model in model_names
+        }
+
+        min_sharpe = min(avg_sharpes.values())
+        adjusted = {k: v - min_sharpe + 0.1 for k, v in avg_sharpes.items()}
+        total = sum(adjusted.values())
+        if total > 0:
+            return {k: v / total for k, v in adjusted.items()}
+        return {k: 1.0 / len(model_names) for k in model_names}
+
+    def predict_proba(self, model_predictions: Dict[str, np.ndarray]) -> np.ndarray:
+        """Generate weighted ensemble predictions."""
+        model_names = list(model_predictions.keys())
+        weights = self.calculate_weights(model_names)
+        ensemble_pred = np.zeros_like(next(iter(model_predictions.values())))
+        for model, pred in model_predictions.items():
+            ensemble_pred += weights.get(model, 0) * pred
+        return ensemble_pred

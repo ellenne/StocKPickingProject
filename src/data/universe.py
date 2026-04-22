@@ -118,7 +118,7 @@ class Universe:
             warn = universe_cfg.get("survivorship_bias_warning", True) if isinstance(universe_cfg, dict) else True
             if warn:
                 logger.warning(
-                    "⚠  No historical constituents CSV provided. "
+                    "WARNING: No historical constituents CSV provided. "
                     "Using CURRENT S&P 500 members only – "
                     "backtest results will be SURVIVORSHIP-BIASED."
                 )

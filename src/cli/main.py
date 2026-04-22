@@ -22,6 +22,7 @@ Usage examples
 
 from __future__ import annotations
 
+import io
 import logging
 import sys
 from pathlib import Path
@@ -31,7 +32,14 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
 
-console = Console()
+# Force UTF-8 on Windows terminals so Unicode characters in log messages
+# (arrows →, check marks ✓, etc.) don't crash the cp1252 legacy renderer.
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
+console = Console(stderr=False)
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -40,7 +48,10 @@ def _setup_logging(verbose: bool) -> None:
         level=level,
         format="%(message)s",
         datefmt="[%X]",
-        handlers=[RichHandler(console=console, rich_tracebacks=True)],
+        handlers=[RichHandler(
+            console=Console(stderr=True),
+            rich_tracebacks=True,
+        )],
     )
 
 
