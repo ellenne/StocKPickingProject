@@ -115,10 +115,19 @@ def generate_current_picks_report(
     path.write_text(md, encoding="utf-8")
     logger.info("Current picks report: %s", path)
 
-    # Also save CSV
+    # Also save CSV — fall back to a timestamped name if the file is locked
     picks_path = outputs_dir / "current_picks.csv"
-    picks.to_csv(picks_path)
-    logger.info("Current picks CSV: %s", picks_path)
+    try:
+        picks.to_csv(picks_path)
+        logger.info("Current picks CSV: %s", picks_path)
+    except PermissionError:
+        from datetime import datetime
+        fallback = outputs_dir / f"current_picks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        picks.to_csv(fallback)
+        logger.warning(
+            "current_picks.csv is locked (open in another program?). "
+            "Saved to %s instead.", fallback
+        )
 
     return md
 

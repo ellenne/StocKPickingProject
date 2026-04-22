@@ -48,7 +48,7 @@ def cached_download(
     """
     path = _cache_path(cache_dir, name)
     if path.exists() and not force_refresh:
-        logger.info("Cache hit  → %s", path.name)
+        logger.info("Cache hit -> %s", path.name)
         return pd.read_parquet(path)
 
     logger.info("Cache miss → fetching '%s'", name)

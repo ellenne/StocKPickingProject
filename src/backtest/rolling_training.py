@@ -1,5 +1,4 @@
 """
-src/backtest/rolling_training.py
 ─────────────────────────────────
 Orchestrates the rolling / expanding-window training and test loop described
 in the paper (Figure 1):
@@ -36,6 +35,7 @@ from src.config import Config
 from src.features.preprocessing import FeaturePreprocessor, build_feature_matrix
 from src.models.base import BaseStockModel, get_model
 from src.models.ensemble import EnsembleModel
+from src.models.ensemble import PerformanceWeightedEnsemble
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +96,37 @@ def _generate_windows(
     return windows
 
 
+def _calculate_model_returns(predictions_df: pd.DataFrame, model_name: str) -> np.array:
+    """Calculate weekly returns for a model based on its predictions.
+    
+    This simulates a top-50 equal-weight portfolio rebalanced weekly.
+    """
+    model_col = f"{model_name}_prob"
+    if model_col not in predictions_df.columns:
+        return np.array([])
+    
+    # Group by date and select top 50 stocks by probability
+    portfolio_returns = []
+    
+    for date in predictions_df.index.get_level_values("date").unique():
+        date_data = predictions_df.loc[date]
+        
+        # Skip if insufficient data
+        if len(date_data) < 50 or date_data["fwd_return"].isna().sum() > len(date_data) * 0.5:
+            continue
+            
+        # Select top 50 by model probability
+        top_stocks = date_data.nlargest(50, model_col)
+        
+        # Calculate equal-weight portfolio return
+        valid_returns = top_stocks["fwd_return"].dropna()
+        if len(valid_returns) > 0:
+            portfolio_return = valid_returns.mean()
+            portfolio_returns.append(portfolio_return)
+    
+    return np.array(portfolio_returns)
+
+
 def run_rolling_backtest(
     feature_panel: pd.DataFrame,
     target_series: pd.Series,
@@ -150,6 +181,12 @@ def run_rolling_backtest(
     all_preds: list[pd.DataFrame] = []
     # key: 1-based window index, value: list of per-epoch history dicts
     dnn_histories: dict[int, list[dict]] = {}
+    
+    # Initialize performance-weighted ensemble
+    perf_ensemble = PerformanceWeightedEnsemble(lookback_windows=3)
+    
+    # Store previous window predictions for performance calculation
+    previous_window_preds = None
 
     for w_idx, window in enumerate(windows):
         w_num = w_idx + 1
@@ -160,6 +197,16 @@ def run_rolling_backtest(
             window.train_start.date(), window.train_end.date(),
             window.test_start.date(), window.test_end.date(),
         )
+
+        # ── Update performance weights from previous window ───────────────
+        if previous_window_preds is not None and w_idx > 0:
+            logger.info(f"Updating performance weights from window {w_idx}")
+            
+            for model_name in base_model_names:
+                if f"{model_name}_prob" in previous_window_preds.columns:
+                    model_returns = _calculate_model_returns(previous_window_preds, model_name)
+                    if len(model_returns) > 0:
+                        perf_ensemble.update_performance(model_name, model_returns)
 
         # ── Slice data ────────────────────────────────────────────────────
         dates = feature_panel.index.get_level_values("date")
@@ -238,11 +285,26 @@ def run_rolling_backtest(
             except Exception as exc:  # noqa: BLE001
                 logger.error("[%s] failed in window %d: %s", model_name, w_num, exc)
 
-        # ── Ensemble ──────────────────────────────────────────────────────
-        if include_ensemble and fitted_models:
-            ensemble = EnsembleModel(fitted_models)
-            ens_proba = ensemble.predict_proba(X_test_s)[:, 1]
-            test_probas["ensemble"] = ens_proba
+        # ── Performance-Weighted Ensemble ─────────────────────────────────
+        if include_ensemble and fitted_models and test_probas:
+            try:
+                # Get current performance weights
+                current_weights = perf_ensemble.calculate_weights(list(test_probas.keys()))
+                
+                # Log the weights being used
+                weights_str = ", ".join([f"{k}: {v:.3f}" for k, v in current_weights.items()])
+                logger.info(f"Window {w_num} ensemble weights: {weights_str}")
+                
+                # Create performance-weighted ensemble predictions
+                ens_proba = perf_ensemble.predict_proba(test_probas)
+                test_probas["ensemble"] = ens_proba
+                
+            except Exception as exc:
+                logger.warning(f"Performance-weighted ensemble failed, falling back to equal weights: {exc}")
+                # Fallback to equal-weight ensemble
+                ensemble = EnsembleModel(fitted_models)
+                ens_proba = ensemble.predict_proba(X_test_s)[:, 1]
+                test_probas["ensemble"] = ens_proba
 
         # ── Assemble predictions DataFrame ────────────────────────────────
         pred_df = pd.DataFrame(index=X_test.index)
@@ -260,6 +322,9 @@ def run_rolling_backtest(
                 )
 
         all_preds.append(pred_df)
+        
+        # Store this window's predictions for next iteration's performance calculation
+        previous_window_preds = pred_df.copy()
 
     if not all_preds:
         raise RuntimeError("Rolling backtest produced no predictions.")
@@ -272,3 +337,4 @@ def run_rolling_backtest(
         result.index.get_level_values("date").max().date(),
     )
     return result, dnn_histories
+    

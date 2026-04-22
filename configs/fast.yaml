@@ -51,19 +51,29 @@ models:
     cv_folds: 3
 
   # DNN: paper architecture (Section 3.5)
-  # 3 hidden layers 20-10-5, BatchNorm, L1=0.0001, RMSprop lr=0.001
-  # Early stopping patience=10 keeps runtime well under 5 min per window.
+  # 3 hidden layers 20-10-5, BatchNorm, RMSprop
+  # Fixes vs original run:
+  #   - l1_reg reduced 10x (was 0.0001 → bottleneck at 5 nodes was killing gradient signal)
+  #   - lr increased 3x (was 0.001 → too slow to escape near-random baseline)
+  #   - weight_decay added (L2 via optimizer, matches LSTM dual-reg scheme)
+  #   - dropout 0.1 (light regularisation without blocking learning)
+  #   - batch_size halved (more gradient updates per epoch)
+  #   - patience increased 10→20 (noisy financial loss landscape needs more time)
+  #   - lr_scheduler ReduceLROnPlateau (halves LR when val plateaus)
   dnn:
     hidden_layers: [20, 10, 5]
     epochs: 100
-    early_stopping_patience: 10
-    learning_rate: 0.001
-    l1_reg: 0.0001
+    early_stopping_patience: 20
+    learning_rate: 0.003
+    l1_reg: 0.00001
+    weight_decay: 0.0001
     batch_norm: true
-    dropout: 0.0
-    batch_size: 512
+    dropout: 0.1
+    batch_size: 256
     grad_clip: 1.0
+    lr_scheduler: true
     log_every_n_epochs: 10
+    diag_every_n_epochs: 20
     seed: 42
 
   # LSTM: paper architecture (Section 3.6)

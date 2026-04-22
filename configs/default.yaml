@@ -97,14 +97,17 @@ models:
     hidden_layers: [20, 10, 5]
     activation: "relu"
     epochs: 100
-    early_stopping_patience: 10
-    learning_rate: 0.001
-    l1_reg: 0.0001
+    early_stopping_patience: 20
+    learning_rate: 0.003
+    l1_reg: 0.00001
+    weight_decay: 0.0001
     batch_norm: true
-    dropout: 0.0
-    batch_size: 512
-    grad_clip: 1.0          # max gradient norm (0 = disabled)
-    log_every_n_epochs: 5   # INFO-level progress frequency
+    dropout: 0.1
+    batch_size: 256
+    grad_clip: 1.0
+    lr_scheduler: true
+    log_every_n_epochs: 5
+    diag_every_n_epochs: 10
     seed: 42
 
   lstm:

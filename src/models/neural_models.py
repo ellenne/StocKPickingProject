@@ -137,27 +137,33 @@ class DNNModel(BaseStockModel):
     learning_rate         : 0.001
     l1_reg                : 0.0001
     batch_norm            : true
-    dropout               : 0.0
-    batch_size            : 512
+    dropout               : 0.1
+    batch_size            : 256
+    weight_decay          : 0.0001    (L2 reg via optimizer — matches LSTM)
     grad_clip             : 1.0       (max gradient norm; 0 = disabled)
+    lr_scheduler          : true      (ReduceLROnPlateau factor=0.5 patience=5)
     log_every_n_epochs    : 5
+    diag_every_n_epochs   : 10        (grad-norm + weight-stats logging interval)
     seed                  : 42
     """
 
     def __init__(self, cfg) -> None:
         self.cfg = cfg
         mc = cfg._raw["models"]["dnn"]
-        self._hidden      = mc.get("hidden_layers", [20, 10, 5])
-        self._epochs      = mc.get("epochs", 100)
-        self._patience    = mc.get("early_stopping_patience", 10)
-        self._lr          = mc.get("learning_rate", 0.001)
-        self._l1          = mc.get("l1_reg", 0.0001)
-        self._bn          = mc.get("batch_norm", True)
-        self._dropout     = mc.get("dropout", 0.0)
-        self._batch_size  = mc.get("batch_size", 512)
-        self._grad_clip   = mc.get("grad_clip", 1.0)
-        self._log_every   = mc.get("log_every_n_epochs", 5)
-        self._seed        = mc.get("seed", cfg.seed)
+        self._hidden        = mc.get("hidden_layers", [20, 10, 5])
+        self._epochs        = mc.get("epochs", 100)
+        self._patience      = mc.get("early_stopping_patience", 20)
+        self._lr            = mc.get("learning_rate", 0.003)
+        self._l1            = mc.get("l1_reg", 0.00001)
+        self._weight_decay  = mc.get("weight_decay", 0.0001)
+        self._bn            = mc.get("batch_norm", True)
+        self._dropout       = mc.get("dropout", 0.1)
+        self._batch_size    = mc.get("batch_size", 256)
+        self._grad_clip     = mc.get("grad_clip", 1.0)
+        self._use_scheduler = mc.get("lr_scheduler", True)
+        self._log_every     = mc.get("log_every_n_epochs", 5)
+        self._diag_every    = mc.get("diag_every_n_epochs", 10)
+        self._seed          = mc.get("seed", cfg.seed)
         self._net: _DNNNet | None = None
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # Training history reset on every fit() call
@@ -195,7 +201,15 @@ class DNNModel(BaseStockModel):
             X_v = _to_tensor(np.asarray(X_val, dtype=np.float32)).to(self._device)
             y_v = _to_tensor(np.asarray(y_val, dtype=np.int64), dtype=torch.long).to(self._device)
 
-        opt = torch.optim.RMSprop(self._net.parameters(), lr=self._lr)
+        opt = torch.optim.RMSprop(
+            self._net.parameters(), lr=self._lr, weight_decay=self._weight_decay
+        )
+        scheduler = (
+            torch.optim.lr_scheduler.ReduceLROnPlateau(
+                opt, mode="min", factor=0.5, patience=5, min_lr=1e-5
+            )
+            if self._use_scheduler else None
+        )
         loss_fn = nn.CrossEntropyLoss()
         best_val_loss = np.inf
         best_train_loss = np.inf
@@ -253,20 +267,48 @@ class DNNModel(BaseStockModel):
                     best_state = copy.deepcopy(self._net.state_dict())
 
             # ── store history ──────────────────────────────────────────────
+            current_lr = opt.param_groups[0]["lr"]
             self.training_history_.append({
                 "epoch":      epoch,
                 "train_loss": round(epoch_train_loss, 6),
                 "val_loss":   round(epoch_val_loss, 6) if epoch_val_loss is not None else None,
                 "is_best":    is_best,
+                "lr":         current_lr,
             })
 
             # ── periodic progress log ──────────────────────────────────────
             if epoch % self._log_every == 0 or epoch == 1:
                 val_str = f"  val={epoch_val_loss:.4f}{'*' if is_best else ' '}" if has_val else ""
+                lr_str = f"  lr={current_lr:.2e}" if scheduler is not None else ""
                 logger.info(
-                    "[%s] ep %3d/%d  train=%.4f%s",
-                    tag, epoch, self._epochs, epoch_train_loss, val_str,
+                    "[%s] ep %3d/%d  train=%.4f%s%s",
+                    tag, epoch, self._epochs, epoch_train_loss, val_str, lr_str,
                 )
+
+            # ── diagnostic: gradient norms + weight statistics ─────────────
+            if epoch % self._diag_every == 0:
+                total_grad_norm = 0.0
+                weight_l1 = 0.0
+                weight_l2 = 0.0
+                n_params = 0
+                for name, p in self._net.named_parameters():
+                    if p.grad is not None:
+                        total_grad_norm += p.grad.data.norm(2).item() ** 2
+                    if "weight" in name:
+                        weight_l1 += p.data.abs().sum().item()
+                        weight_l2 += (p.data ** 2).sum().item()
+                        n_params  += p.data.numel()
+                total_grad_norm = total_grad_norm ** 0.5
+                logger.info(
+                    "[%s] diag ep %3d  grad_norm=%.4f  w_L1/n=%.6f  w_L2/n=%.6f",
+                    tag, epoch, total_grad_norm,
+                    weight_l1 / max(n_params, 1),
+                    weight_l2 / max(n_params, 1),
+                )
+
+            # ── LR scheduler step (val-loss driven) ───────────────────────
+            if scheduler is not None and epoch_val_loss is not None:
+                scheduler.step(epoch_val_loss)
 
             # ── early stopping ─────────────────────────────────────────────
             if has_val and patience_cnt >= self._patience:
