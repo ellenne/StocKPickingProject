@@ -288,15 +288,13 @@ def run_rolling_backtest(
         # ── Performance-Weighted Ensemble ─────────────────────────────────
         if include_ensemble and fitted_models and test_probas:
             try:
-                # Get current performance weights
-                current_weights = perf_ensemble.calculate_weights(list(test_probas.keys()))
-                
-                # Log the weights being used
-                weights_str = ", ".join([f"{k}: {v:.3f}" for k, v in current_weights.items()])
-                logger.info(f"Window {w_num} ensemble weights: {weights_str}")
-                
-                # Create performance-weighted ensemble predictions
-                ens_proba = perf_ensemble.predict_proba(test_probas)
+                # predict_proba() returns (predictions, weights) so the weights
+                # we log are exactly those applied — no redundant pre-calculation.
+                ens_proba, applied_weights = perf_ensemble.predict_proba(test_probas)
+                weights_str = ", ".join(
+                    f"{k}: {v:.3f}" for k, v in applied_weights.items()
+                )
+                logger.info("Window %d ensemble weights: %s", w_num, weights_str)
                 test_probas["ensemble"] = ens_proba
                 
             except Exception as exc:

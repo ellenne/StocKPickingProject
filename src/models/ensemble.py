@@ -96,7 +96,14 @@ class PerformanceWeightedEnsemble:
             )
 
     def calculate_weights(self, model_names: List[str]) -> Dict[str, float]:
-        """Calculate performance-weighted ensemble weights."""
+        """Calculate performance-weighted ensemble weights.
+
+        Returns an empty dict when ``model_names`` is empty rather than
+        letting ``min()`` raise ``ValueError`` on an empty sequence.
+        """
+        if not model_names:
+            return {}
+
         avg_sharpes = {
             model: (
                 float(np.mean(self.performance_history[model]))
@@ -113,11 +120,22 @@ class PerformanceWeightedEnsemble:
             return {k: v / total for k, v in adjusted.items()}
         return {k: 1.0 / len(model_names) for k in model_names}
 
-    def predict_proba(self, model_predictions: Dict[str, np.ndarray]) -> np.ndarray:
-        """Generate weighted ensemble predictions."""
+    def predict_proba(
+        self, model_predictions: Dict[str, np.ndarray]
+    ) -> "tuple[np.ndarray, Dict[str, float]]":
+        """Generate weighted ensemble predictions.
+
+        Returns
+        -------
+        ensemble_pred : np.ndarray
+            Weighted-average prediction array.
+        weights : Dict[str, float]
+            The weights actually applied, so callers can log them without a
+            redundant second call to ``calculate_weights()``.
+        """
         model_names = list(model_predictions.keys())
         weights = self.calculate_weights(model_names)
         ensemble_pred = np.zeros_like(next(iter(model_predictions.values())))
         for model, pred in model_predictions.items():
             ensemble_pred += weights.get(model, 0) * pred
-        return ensemble_pred
+        return ensemble_pred, weights

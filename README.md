@@ -54,7 +54,7 @@ StocKPickingProject/
 │   │   ├── linear_models.py       # Ridge, Lasso, ElasticNet, PCA+LR
 │   │   ├── tree_models.py         # RandomForest, XGBoost
 │   │   ├── neural_models.py       # DNN (PyTorch), LSTM (PyTorch)
-│   │   └── ensemble.py            # Simple average ensemble
+│   │   └── ensemble.py            # EnsembleModel (mean) + PerformanceWeightedEnsemble (Sharpe-weighted)
 │   ├── backtest/
 │   │   ├── rolling_training.py    # Rolling 3yr train / 1yr test loop
 │   │   ├── portfolio.py           # Top-N equal-weight portfolio + benchmarks
@@ -67,15 +67,21 @@ StocKPickingProject/
 │   └── cli/
 │       └── main.py                # Click CLI commands
 ├── configs/
-│   └── default.yaml               # All configurable parameters
+│   ├── default.yaml               # Full parameter reference
+│   └── fast.yaml                  # Quick-run overrides (~30-60 min)
 ├── data/
 │   ├── raw/                       # Cached parquet downloads
 │   └── processed/                 # Feature panels
 ├── outputs/                       # Charts, CSV exports, reports
 ├── tests/
+│   ├── logging_utils.py           # Enhanced dual-output logging (console + file)
 │   ├── test_features.py
 │   ├── test_target.py
-│   └── test_backtest.py
+│   ├── test_backtest.py
+│   ├── test_lstm_sequences.py
+│   ├── test_shap_analysis.py
+│   ├── diagnose_lstm.py
+│   └── validate_paper_alignment.py
 ├── requirements.txt
 └── pyproject.toml
 ```
@@ -100,9 +106,9 @@ StocKPickingProject/
 | PCA + LR | n_components chosen by TS-CV up to 90% variance elbow |
 | Random Forest | Exact paper grid (trees, depth, min_leaf), 5-fold TS-CV |
 | XGBoost | Replaces AdaBoost (same grid spirit) with early stopping |
-| DNN | PyTorch: 3 layers (20-10-5), BatchNorm, L1 reg, RMSprop lr=0.001 |
-| LSTM | PyTorch: 1 layer 30 cells, seq_len=8 weeks, RMSprop lr=0.001 |
-| Ensemble | Simple average of all model probabilities |
+| DNN | PyTorch: 3 layers (20-10-5), BatchNorm, L1+L2 reg, RMSprop lr=0.003, ReduceLROnPlateau |
+| LSTM | PyTorch: 1 layer 30 cells, seq_len=8 weeks, dropout=0.2, RMSprop lr=0.001 |
+| Ensemble | Simple average (`EnsembleModel`) + Sharpe-weighted variant (`PerformanceWeightedEnsemble`) |
 | Portfolio | Top-50 equal-weight long-only, weekly rebalance |
 | Transaction costs | Configurable bps; BTC calculated per paper |
 | Benchmarks | 1/N equal-weight universe + SPY weekly returns |
@@ -171,23 +177,26 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 ### Full pipeline (recommended first run)
 
 ```bash
-python -m src.cli.main full-run
+python run_pipeline_capture.py
 ```
 
-### Step by step
+This runs all four steps sequentially and saves a timestamped log to
+`outputs/full_pipeline_log_<timestamp>.txt`.
+
+### Step by step (with fast config)
 
 ```bash
 # 1. Download and cache raw data
-python -m src.cli.main download-data
+python -m src.cli.main --config configs/fast.yaml download-data
 
 # 2. Build feature panel (technical + fundamentals + target)
-python -m src.cli.main build-dataset
+python -m src.cli.main --config configs/fast.yaml build-dataset
 
 # 3. Train rolling models and run backtest
-python -m src.cli.main train-backtest
+python -m src.cli.main --config configs/fast.yaml train-backtest
 
 # 4. Show and save current picks
-python -m src.cli.main current-picks --top-n 50
+python -m src.cli.main --config configs/fast.yaml current-picks --top-n 50
 ```
 
 ### Options
@@ -208,6 +217,47 @@ python -m src.cli.main train-backtest --no-tc
 # Force re-download all data
 python -m src.cli.main download-data --force-refresh
 ```
+
+---
+
+## Logging
+
+### Enhanced console + file logging
+
+`tests/logging_utils.py` provides a dual-output logger that simultaneously streams to the terminal **and** writes a timestamped file under `logs/`.
+
+**Enable via the CLI flag:**
+
+```bash
+python -m src.cli.main --config configs/fast.yaml train-backtest --enable-logging
+```
+
+**Or activate programmatically:**
+
+```python
+from tests.logging_utils import setup_enhanced_logging
+
+log_file = setup_enhanced_logging(log_dir="logs")
+# everything printed or logged after this point is mirrored to log_file
+```
+
+**Helper shortcuts:**
+
+```python
+from tests.logging_utils import train_with_logging, build_dataset_with_logging
+
+train_with_logging()          # runs train-backtest with full capture
+build_dataset_with_logging()  # runs build-dataset with full capture
+```
+
+**Or from the shell:**
+
+```bash
+python tests/logging_utils.py train    # train-backtest with full logging
+python tests/logging_utils.py build    # build-dataset with full logging
+```
+
+Log files are written to `logs/console_log_<YYYYMMDD_HHMMSS>.txt`.  Each line in the log includes a `[HH:MM:SS]` timestamp, level, module name, and line number.  `print()` statements are captured with a `[PRINT]` prefix; stderr output with `[ERROR]`.
 
 ---
 
@@ -292,6 +342,53 @@ import shap
 explainer = shap.TreeExplainer(rf_model._clf)
 shap_values = explainer.shap_values(X_test)
 ```
+
+---
+
+## Recent improvements
+
+### DNN training overhaul
+
+The DNN was found to barely improve above the random baseline (val loss only 2.2% below `ln(2) ≈ 0.693` after 46 epochs).  Root cause: the original `l1_reg=0.0001` was too aggressive for the narrow 5-node bottleneck layer, effectively zeroing most weights and blocking gradient signal.
+
+Changes applied in `configs/fast.yaml` and `configs/default.yaml`:
+
+| Parameter | Before | After | Reason |
+|---|---|---|---|
+| `learning_rate` | 0.001 | **0.003** | Escape the near-random plateau faster |
+| `l1_reg` | 0.0001 | **0.00001** | 10x lighter — was collapsing the 5-node bottleneck |
+| `weight_decay` | — | **0.0001** | L2 reg via RMSprop optimizer (matches LSTM dual-reg) |
+| `dropout` | 0.0 | **0.1** | Light regularisation without blocking learning |
+| `batch_size` | 512 | **256** | More gradient updates per epoch |
+| `early_stopping_patience` | 10 | **20** | Financial loss is noisy; extra time to converge |
+| `lr_scheduler` | — | **ReduceLROnPlateau** | Halves LR when val plateaus (factor=0.5, patience=5) |
+
+New per-epoch diagnostics are logged every `diag_every_n_epochs` epochs:
+
+```
+[dnn] diag ep  20  grad_norm=0.3821  w_L1/n=0.012341  w_L2/n=0.000891
+```
+
+Training history (saved to `outputs/dnn_training_histories.json`) now also records `lr` per epoch for post-hoc loss-curve inspection.
+
+### Windows terminal encoding fix
+
+All Unicode characters in log messages (`→`, `⚠`, checkmarks, emojis) crashed the Windows `cp1252` legacy terminal renderer.  Fixed in `src/cli/main.py` by reconfiguring `sys.stdout`/`sys.stderr` to UTF-8 at startup, and passing `PYTHONIOENCODING=utf-8` to each subprocess in `run_pipeline_capture.py`.
+
+### Ensemble fixes
+
+`src/models/ensemble.py` now contains two ensemble classes:
+
+- **`EnsembleModel`** — simple mean of all model probabilities (paper Section 3.7).
+- **`PerformanceWeightedEnsemble`** — rolling Sharpe-ratio-weighted ensemble; used by the backtest loop in `rolling_training.py`.
+
+Two bugs were fixed in `PerformanceWeightedEnsemble`:
+1. `calculate_weights([])` now returns `{}` instead of crashing with `ValueError: min() arg is an empty sequence`.
+2. `predict_proba()` now returns `(predictions, weights)` so callers log the weights that were actually applied — previously the logged weights were a separate throwaway calculation.
+
+### Output file locking
+
+`outputs/current_picks.csv` is now written with a `PermissionError` fallback: if the file is locked (e.g. open in Excel), the report is saved to `current_picks_<timestamp>.csv` and a warning is logged.
 
 ---
 
